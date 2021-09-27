@@ -1,0 +1,43 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: gameoflife
+  namespace: gameoflife
+  labels:
+    app: gameoflife
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gameoflife
+  template:
+    metadata:
+      labels:
+        app: gameoflife
+    spec:
+      containers:
+      - name: gameoflife
+        image: nexus.hcldevopscoe.com:30543/gameoflife-web:${BUILDNUMBER}
+        ports:
+        - containerPort: 8080
+      imagePullSecrets:
+      - name: nexussecret
+
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: gameoflife
+  namespace: gameoflife
+  labels:
+    name: gameoflife
+spec:
+  type: NodePort
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: gameoflife
+  selector:
+    app: gameoflife

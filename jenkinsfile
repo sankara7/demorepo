@@ -1,0 +1,183 @@
+pipeline {
+    agent any
+	options {
+	buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '5', numToKeepStr: '10')
+	}
+	
+	 parameters {
+        choice(choices: ['tags/lesscoverage', 'tags/testcasefailure', 'master'], description: '', name: 'TAG')
+    }
+	
+	environment {
+        BUILD_NUM = "${env.BUILD_NUMBER}"
+        
+    }
+	
+	tools {     
+		jdk 'JDK_8'
+        maven 'Maven_3.6.0'
+	}
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM', branches: [[name: 'stage']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'd5cc8c63-8438-44af-b955-cc3387665b51', url: 'http://gitlab:30080/coe/game-of-life.git']]])
+            }
+        }
+        stage('Build and Unit Test') { 
+            steps {
+                sh 'mvn -gs /var/jenkins_home/.m2/settings.xml clean test -Dmaven.test.failure.ignore=true'
+            }
+        }
+		
+		
+		stage('Sonar') { 
+            steps {
+			script {
+			scannerHome = tool 'SonarQubeScanner_3.2.0'
+                withSonarQubeEnv('SonarQube') {
+        sh "${scannerHome}/bin/sonar-scanner -e -X -Dsonar.projectName=$JOB_NAME -Dsonar.projectKey=$JOB_NAME -Dsonar.modules=gameoflife-core,gameoflife-web -Dgameoflife-core.sonar.java.binaries=target/classes -Dgameoflife-web.sonar.java.binaries=target/classes -Dgameoflife-core.sonar.sources=src/main -Dgameoflife-web.sonar.sources=src/main -Dgameoflife-core.sonar.tests=src/test -Dgameoflife-web.sonar.tests=src/test -Dgameoflife-core.sonar.junit.reportsPath=/target/surefire-reports -Dgameoflife-web.sonar.junit.reportsPath=/target/surefire-reports -Dgameoflife-core.sonar.jacoco.reportPath=target/jacoco.exec -Dgameoflife-web.sonar.jacoco.reportPath=target/jacoco.exec"
+        }
+		}
+
+        }
+        }
+		
+		// need to configure webhook in Sonarqube ref : https://blog.sonarsource.com/breaking-the-sonarqube-analysis-with-jenkins-pipelines/
+		
+		stage('Gates') {
+		
+		parallel {
+		stage("Sonar Gate") { 
+		steps {
+		  script {
+		   
+		  timeout(time: 1, unit: 'HOURS') { // Just in case something goes wrong, pipeline will be killed after a timeout
+		  def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+		  if (qg.status != 'OK') {
+			error "Pipeline aborted due to quality gate failure: ${qg.status}"
+		}
+		}
+        
+		}
+		}
+		}
+		stage('Unit Test Gate') { 
+            steps {
+                xunit thresholds: [failed(failureThreshold: '2', unstableThreshold: '1')], tools: [JUnit(deleteOutputFiles: true, failIfNotNew: true, pattern: '**/gameoflife-web/target/surefire-reports/*.xml,**/gameoflife-core/target/surefire-reports/*.xml', skipNoTestFiles: true, stopProcessingIfError: false)]
+				script {
+				if (currentBuild.result.equals("FAILURE")) {
+					error "Pipeline aborted due to quality gate failure"
+				}
+				}
+            }
+        }
+		
+		stage('JaCoCo Coverage Gate') { 
+            steps {
+                jacoco buildOverBuild: true, changeBuildStatus: true, classPattern: '**/target/classes', deltaBranchCoverage: '10', deltaClassCoverage: '10', deltaComplexityCoverage: '10', deltaInstructionCoverage: '10', deltaLineCoverage: '10', deltaMethodCoverage: '10', execPattern: '**/target/**.exec', maximumBranchCoverage: '95', maximumClassCoverage: '95', maximumComplexityCoverage: '95', maximumInstructionCoverage: '95', maximumLineCoverage: '95', maximumMethodCoverage: '95', minimumBranchCoverage: '90', minimumClassCoverage: '90', minimumComplexityCoverage: '90', minimumInstructionCoverage: '90', minimumLineCoverage: '90', minimumMethodCoverage: '90', sourcePattern: '**/src/main/java/**'
+			}
+        }
+		}
+		}
+		
+		
+		stage('Packing') { 
+            steps {
+                sh 'mvn -gs /var/jenkins_home/.m2/settings.xml install deploy -Dbuild.number=${BUILD_NUMBER} -DskipTests'
+            }
+        }
+		
+		stage('Creating Docker Image') { 
+            steps {
+			    sh 'cp gameoflife-web/target/gameoflife-1.0.*.war gameoflife-web/target/gameoflife.war'
+                script {
+				withDockerServer([uri: 'unix:///var/run/docker.sock']) {
+				
+				withDockerRegistry([credentialsId: 'nexus', url: "http://10.106.131.14:58082"]) {
+          
+				def image = docker.build("10.106.131.14:58082/gameoflife-web:${BUILD_NUMBER}", "${WORKSPACE}/gameoflife-web/")
+				image.push()
+				}
+				}
+				}
+				
+            }
+        }
+		
+		stage('Remove local images') { 
+			steps {
+				sh("docker rmi -f 10.106.131.14:58082/gameoflife-web:${BUILD_NUMBER}")
+			}
+		
+		}
+		
+		stage('Archive') { 
+            steps {
+                archiveArtifacts 'gameoflife-web/target/gameoflife-*.war'
+				}
+        }
+		
+		stage('Publish HTML Reports') { 
+            steps {
+                publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: false, reportDir: 'gameoflife-web/target/site/jacoco', reportFiles: 'index.html', reportName: 'Jacoco Report Game of Life Web', reportTitles: ''])
+				publishHTML([allowMissing: false, alwaysLinkToLastBuild: false, keepAll: false, reportDir: 'gameoflife-core/target/site/jacoco', reportFiles: 'index.html', reportName: 'Jacoco Report Game of Life Core', reportTitles: ''])
+
+			}
+        }
+		
+		stage('Publish Junit Test Reports') { 
+            steps {
+                junit 'gameoflife-core/target/surefire-reports/*.xml,gameoflife-web/target/surefire-reports/*.xml'
+			}
+        }
+		
+		stage('Deployment') { 
+		parallel {
+		stage('Tomcat Deployment') { 
+            steps {
+                script {
+                def jobBuild = build job: 'game-of-life-deployment' , propagate: true , wait: true , parameters: [string(name: 'deploymentType', value: 'kubernetesDeployment')]
+			    def jobResult = jobBuild.getResult()
+			    echo "Build of 'game-of-life-deployment' returned result: ${jobResult}"
+			    if (jobResult != 'SUCCESS') {
+                        error("game-of-life-deployment failed with result: ${jobResult}")
+                }
+			    }
+			}
+			}
+		stage('Kubernetes Deployment') { 
+            steps {
+            script {
+                def jobBuild = build job: 'game-of-life-kubernetes-deployment', parameters: [string(name: 'BUILDNUMBER', value: "$BUILD_NUM")]
+                def jobResult = jobBuild.getResult()
+			    echo "Build of 'game-of-life-kubernetes-deployment' returned result: ${jobResult}"
+			    if (jobResult != 'SUCCESS') {
+                        error("game-of-life-kubernetes-deployment failed with result: ${jobResult}")
+                }
+                }
+			}
+			}
+		}
+        }
+        
+        stage('ZAP Testing') { 
+            steps {
+            script {
+                def jobBuild = build job: 'game-of-life-ZAP'
+                def jobResult = jobBuild.getResult()
+			    echo "Build of 'game-of-life-ZAP' returned result: ${jobResult}"
+			    if (jobResult != 'SUCCESS') {
+                        error("game-of-life-ZAP failed with result: ${jobResult}")
+                }
+			}
+			}
+        }
+       }
+        post {
+        
+        success {
+            echo "All builds completed OK"
+        }
+        
+        }
+}
